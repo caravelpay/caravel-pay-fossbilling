@@ -61,13 +61,18 @@ final class FossLedger implements Ledger
             $this->log('error', 'Invoice ' . $invoice->ref . ' has no client; the Caravel Pay payment was not recorded.');
             return false;
         }
+        // client_balance.rel_id is VARCHAR(20): reference the transaction/invoice id here and keep the full tx hash in description and txn_id.
+        $relId = $this->transactionId > 0 ? (string) $this->transactionId : $invoice->ref;
+        if (strlen($relId) > 20) {
+            $relId = substr($relId, 0, 20);
+        }
         // Funds first: if this throws, nothing was added and the webhook is retried.
         $this->api->client_balance_add_funds(array(
             'id' => $clientId,
             'amount' => $nativeAmount,
             'description' => 'Caravel Pay payment ' . $txHash,
-            'type' => 'Caravel Pay',
-            'rel_id' => $txHash,
+            'type' => 'transaction',
+            'rel_id' => $relId,
         ));
         $this->updateTransaction(array('invoice_id' => (int) $invoice->ref, 'txn_id' => $txHash, 'txn_status' => 'paid', 'amount' => $nativeAmount, 'currency' => $invoice->nativeCurrency, 'status' => 'processed'));
         $paid = false;
@@ -86,7 +91,8 @@ final class FossLedger implements Ledger
             $this->note($invoice->ref, 'Caravel Pay payment confirmed (checkout ' . $checkout['id'] . '). Payout: ' . implode('; ', $payout) . '.');
         } else {
             // The funds are on the client's balance: never add them twice, ask the admin to apply them.
-            $this->note($invoice->ref, 'Caravel Pay added $' . $nativeAmount . ' to the client\'s credit balance (checkout ' . $checkout['id'] . '), but it could not be applied to this invoice automatically. Apply the credit to the invoice.');
+            $amountLabel = '' !== $invoice->nativeCurrency ? $nativeAmount . ' ' . $invoice->nativeCurrency : '$' . $nativeAmount;
+            $this->note($invoice->ref, 'Caravel Pay added ' . $amountLabel . ' to the client\'s credit balance (checkout ' . $checkout['id'] . '), but it could not be applied to this invoice automatically. Apply the credit to the invoice.');
             $this->log('error', 'Invoice ' . $invoice->ref . ': payment credited to the client but not applied to the invoice.');
         }
         return true;

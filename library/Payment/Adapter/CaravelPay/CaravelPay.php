@@ -13,17 +13,27 @@
 require_once __DIR__ . '/lib/caravel-php/autoload.php';
 require_once __DIR__ . '/lib/caravel-kit/autoload.php';
 require_once __DIR__ . '/src/FossLedger.php';
+if (!interface_exists('FOSSBilling\\Core\\Payment\\JsonWebhookAuthenticatorInterface')) {
+    require_once __DIR__ . '/src/JsonWebhookAuthenticatorInterface.php';
+}
 
 use CaravelPay\Currency;
+use CaravelPay\Exception\SignatureVerificationException;
 use CaravelPay\FeeMode;
 use CaravelPay\Kit\Gateway;
 use CaravelPay\Kit\PdoStorage;
 use CaravelPay\Webhook;
 use CaravelPay\FossBilling\FossLedger;
 
-class Payment_Adapter_CaravelPay
+class Payment_Adapter_CaravelPay implements \FOSSBilling\Core\Payment\JsonWebhookAuthenticatorInterface
 {
-    const VERSION = '1.2.1';
+    const VERSION = '1.2.2';
+    const AUTH_CACHE_KEY = 'fb_webhook_auth';
+    const AUTH_CACHE_TTL = 86400;
+    const AUTH_CACHE_MAX = 100;
+
+    /** @var array<string, array{merchant: string, timestamp: string, event: string, expires_at: int}> */
+    private static $authenticatedWebhooks = array();
 
     /** @var array<string, mixed> */
     private $config;
@@ -112,6 +122,38 @@ class Payment_Adapter_CaravelPay
     }
 
     /**
+     * Synchronous HMAC verification called by FOSSBilling (main / 0.9+) before persisting the
+     * transaction or flushing an early 200 OK response under PHP-FPM.
+     */
+    public function authenticateJsonWebhook(array $data): void
+    {
+        $server = isset($data['server']) && is_array($data['server']) ? $data['server'] : array();
+        $method = isset($server['REQUEST_METHOD']) ? strtoupper((string) $server['REQUEST_METHOD']) : 'POST';
+        if ('POST' !== $method) {
+            $this->rejectWebhook(405, 'method_not_allowed');
+        }
+        $urls = $this->webhookUrls($server);
+        if (!$urls) {
+            $this->rejectWebhook(503, 'no_callback_url');
+        }
+        $storage = $this->storage();
+        $now = $this->now();
+        $secrets = $this->webhookSecrets($storage, $now);
+        if (!$secrets) {
+            $this->rejectWebhook(503, 'not_connected');
+        }
+        $body = isset($data['http_raw_post_data']) ? (string) $data['http_raw_post_data'] : '';
+        $headers = Webhook::headersFromServer($server);
+        try {
+            $event = Webhook::verify($body, $headers, $secrets, $urls, array('now' => $now));
+        } catch (SignatureVerificationException $e) {
+            $this->rejectWebhook($e->getHttpStatus(), $e->getReason());
+            return;
+        }
+        $this->rememberAuthenticatedHeaders($storage, $headers, $body, $event->merchantId, $event->id, $now);
+    }
+
+    /**
      * ipn.php → here. Verify, re-fetch, apply. FOSSBilling answers 200 even when this throws, so
      * failures set the HTTP status themselves to make Caravel Pay retry.
      */
@@ -124,15 +166,10 @@ class Payment_Adapter_CaravelPay
         if ('POST' !== $method) {
             $result = array('status' => 405, 'result' => 'method_not_allowed');
         } else {
-            $urls = array();
-            if (!empty($this->config['notify_url'])) {
-                $urls[] = (string) $this->config['notify_url'];
-            }
-            if (!empty($server['REQUEST_URI']) && '/' === substr((string) $server['REQUEST_URI'], 0, 1)) {
-                $urls[] = (string) $server['REQUEST_URI'];
-            }
+            $urls = $this->webhookUrls($server);
             $body = isset($data['http_raw_post_data']) ? (string) $data['http_raw_post_data'] : '';
-            $result = $urls ? $this->gateway($ledger)->handleWebhook($body, Webhook::headersFromServer($server), $urls) : array('status' => 503, 'result' => 'no_callback_url');
+            $headers = $this->restoreAuthenticatedHeaders($this->storage(), Webhook::headersFromServer($server), $body, $this->now());
+            $result = $urls ? $this->gateway($ledger)->handleWebhook($body, $headers, $urls) : array('status' => 503, 'result' => 'no_callback_url');
         }
         $ok = $result['status'] >= 200 && $result['status'] < 300;
         $ledger->updateTransaction(array(
@@ -143,11 +180,7 @@ class Payment_Adapter_CaravelPay
             'error_code' => $ok ? '' : (string) $result['status'],
         ));
         if (!$ok) {
-            if (!headers_sent()) {
-                http_response_code($result['status']);
-            }
-            $message = 'Caravel Pay webhook not processed: ' . $result['result'];
-            throw class_exists('Payment_Exception') ? new \Payment_Exception($message) : new \RuntimeException($message);
+            $this->rejectWebhook($result['status'], $result['result']);
         }
         return true;
     }
@@ -176,10 +209,157 @@ class Payment_Adapter_CaravelPay
                 $config[$option] = $this->config[$key]; // Tests only: never part of the saved settings form.
             }
         }
+        return new Gateway($this->storage(), $ledger, $config);
+    }
+
+    private function storage()
+    {
         $crypt = $this->service('crypt');
         $encrypt = is_object($crypt) && method_exists($crypt, 'encrypt') ? function ($v) use ($crypt) { return (string) $crypt->encrypt($v); } : null;
         $decrypt = is_object($crypt) && method_exists($crypt, 'decrypt') ? function ($v) use ($crypt) { return (string) $crypt->decrypt($v); } : null;
-        return new Gateway(new PdoStorage($this->service('pdo'), 'caravelpay_', $encrypt, $decrypt), $ledger, $config);
+        return new PdoStorage($this->service('pdo'), 'caravelpay_', $encrypt, $decrypt);
+    }
+
+    private function now()
+    {
+        return isset($this->config['caravel_clock']) && is_callable($this->config['caravel_clock'])
+            ? (int) call_user_func($this->config['caravel_clock'])
+            : time();
+    }
+
+    /** @return string[] */
+    private function webhookUrls(array $server)
+    {
+        $urls = array();
+        if (!empty($this->config['notify_url'])) {
+            $urls[] = (string) $this->config['notify_url'];
+        }
+        if (!empty($server['REQUEST_URI']) && '/' === substr((string) $server['REQUEST_URI'], 0, 1)) {
+            $urls[] = (string) $server['REQUEST_URI'];
+        }
+        return $urls;
+    }
+
+    /** @return array<string, string> */
+    private function webhookSecrets(PdoStorage $storage, $now)
+    {
+        $secrets = array();
+        foreach ($storage->credentials() as $row) {
+            $merchant = (string) $row['merchant_id'];
+            if ('current' === $row['status']
+                || (int) $row['retired_at'] >= $now - Gateway::KEEP_RETIRED_SECONDS
+                || $storage->latestCheckoutAt($merchant) >= $now - Gateway::KEEP_RETIRED_SECONDS) {
+                $secrets[$merchant] = (string) $row['secret'];
+            }
+        }
+        return $secrets;
+    }
+
+    private function rejectWebhook($status, $reason)
+    {
+        if (!headers_sent()) {
+            http_response_code((int) $status);
+        }
+        $message = 'Caravel Pay webhook not processed: ' . $reason;
+        throw class_exists('Payment_Exception') ? new \Payment_Exception($message) : new \RuntimeException($message);
+    }
+
+    private static function webhookAuthKey($signature, $body)
+    {
+        return hash('sha256', strtolower(trim((string) $signature)) . "\n" . $body);
+    }
+
+    private function rememberAuthenticatedHeaders(PdoStorage $storage, array $headers, $body, $merchantId, $eventId, $now)
+    {
+        $signature = isset($headers['caravel-signature']) ? (string) $headers['caravel-signature'] : '';
+        $timestamp = isset($headers['caravel-timestamp']) ? (string) $headers['caravel-timestamp'] : '';
+        if ('' === $signature || '' === $timestamp) {
+            return;
+        }
+        $key = self::webhookAuthKey($signature, $body);
+        $entry = array(
+            'merchant' => (string) $merchantId,
+            'timestamp' => $timestamp,
+            'event' => (string) $eventId,
+            'expires_at' => (int) $now + self::AUTH_CACHE_TTL,
+        );
+        self::$authenticatedWebhooks[$key] = $entry;
+        if (count(self::$authenticatedWebhooks) > self::AUTH_CACHE_MAX) {
+            self::$authenticatedWebhooks = array_slice(self::$authenticatedWebhooks, -self::AUTH_CACHE_MAX, null, true);
+        }
+        $lock = null;
+        try {
+            $lock = $storage->lock(self::AUTH_CACHE_KEY, 5, (int) $now);
+            $raw = $storage->setting(self::AUTH_CACHE_KEY);
+            $map = is_string($raw) ? json_decode($raw, true) : array();
+            if (!is_array($map)) {
+                $map = array();
+            }
+            foreach ($map as $k => $v) {
+                if (!is_array($v) || !isset($v['expires_at']) || (int) $v['expires_at'] < $now) {
+                    unset($map[$k]);
+                }
+            }
+            $map[$key] = $entry;
+            if (count($map) > self::AUTH_CACHE_MAX) {
+                $map = array_slice($map, -self::AUTH_CACHE_MAX, null, true);
+            }
+            $storage->saveSetting(self::AUTH_CACHE_KEY, (string) json_encode($map));
+        } catch (\Throwable $e) {
+            // In-process cache still handles same-request processTransaction().
+        } finally {
+            if (null !== $lock) {
+                $storage->unlock(self::AUTH_CACHE_KEY, $lock);
+            }
+        }
+    }
+
+    /**
+     * Restore Caravel-Merchant / Caravel-Timestamp / Caravel-Event when FOSSBilling main strips
+     * non-signature HTTP_* headers from stored IPN payloads after authenticateJsonWebhook() succeeded.
+     *
+     * @param array<string, string> $headers
+     *
+     * @return array<string, string>
+     */
+    private function restoreAuthenticatedHeaders(PdoStorage $storage, array $headers, $body, $now)
+    {
+        if (!isset($headers['caravel-signature']) || '' === $headers['caravel-signature']) {
+            return $headers;
+        }
+        if (isset($headers['caravel-merchant']) && '' !== $headers['caravel-merchant']
+            && isset($headers['caravel-timestamp']) && '' !== $headers['caravel-timestamp']) {
+            return $headers;
+        }
+        $key = self::webhookAuthKey($headers['caravel-signature'], $body);
+        $entry = isset(self::$authenticatedWebhooks[$key]) ? self::$authenticatedWebhooks[$key] : null;
+        if (null === $entry) {
+            try {
+                $raw = $storage->setting(self::AUTH_CACHE_KEY);
+                $map = is_string($raw) ? json_decode($raw, true) : null;
+                if (is_array($map) && isset($map[$key]) && is_array($map[$key])) {
+                    $entry = $map[$key];
+                }
+            } catch (\Throwable $e) {
+                $entry = null;
+            }
+        }
+        if (!is_array($entry) || !isset($entry['expires_at']) || (int) $entry['expires_at'] < $now) {
+            return $headers;
+        }
+        if ((!isset($headers['caravel-merchant']) || '' === $headers['caravel-merchant'])
+            && isset($entry['merchant']) && is_string($entry['merchant'])) {
+            $headers['caravel-merchant'] = $entry['merchant'];
+        }
+        if ((!isset($headers['caravel-timestamp']) || '' === $headers['caravel-timestamp'])
+            && isset($entry['timestamp']) && is_string($entry['timestamp'])) {
+            $headers['caravel-timestamp'] = $entry['timestamp'];
+        }
+        if ((!isset($headers['caravel-event']) || '' === $headers['caravel-event'])
+            && isset($entry['event']) && is_string($entry['event'])) {
+            $headers['caravel-event'] = $entry['event'];
+        }
+        return $headers;
     }
 
     private function url($primary, $fallback)
